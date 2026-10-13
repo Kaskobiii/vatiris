@@ -2,20 +2,24 @@ import { Router, Request, Response } from "express"
 import { timingSafeEqual } from "crypto"
 import axios from "axios"
 import auth from "../auth"
+import { isKnownUser } from "../db"
 import { AmanRooms, Client, RelayError } from "../aman/rooms"
 
-interface Principal { cid?: number; training?: boolean }
+interface Principal { cid?: number; training?: boolean; callsign?: string }
 interface Dependencies {
     rooms?: AmanRooms
     authenticate?: (req: Request, res: Response) => Promise<Principal | undefined>
     connected?: (cid: number, callsign: string) => Promise<boolean>
     supervisors?: () => Set<number>
+    registeredCidEnabled?: () => boolean
+    knownUser?: (cid: number) => Promise<boolean>
+    controllerCid?: (callsign: string) => Promise<number | undefined>
 }
 const supervisors = () => new Set((process.env.AMAN_SUPERVISOR_CIDS ?? "1396125").split(",").map(Number).filter(x => x > 0))
 let controllers: { cid: number; callsign: string }[] = []
 let fetched = 0
 let fetching: Promise<void> | undefined
-async function connected(cid: number, callsign: string) {
+async function refreshControllers() {
     if (Date.now() - fetched >= 15_000) {
         fetching ||= axios.get("https://data.vatsim.net/v3/vatsim-data.json", { timeout: 8000 }).then(result => {
             controllers = (result.data.controllers || []).filter((c: any) => c.facility > 0)
@@ -24,7 +28,14 @@ async function connected(cid: number, callsign: string) {
         }).finally(() => { fetching = undefined })
         try { await fetching } catch { throw new RelayError(503, "VATSIM controller feed unavailable") }
     }
+}
+async function connected(cid: number, callsign: string) {
+    await refreshControllers()
     return controllers.some(c => c.cid === cid && c.callsign === callsign)
+}
+async function controllerCid(callsign: string) {
+    await refreshControllers()
+    return controllers.find(c => c.callsign === callsign)?.cid
 }
 async function authenticate(req: Request, res: Response): Promise<Principal | undefined> {
     if (req.headers.authorization?.startsWith("Bearer ")) {
@@ -65,7 +76,23 @@ function client(req: Request, principal: Principal): Client {
 
 export function createAmanRoomsRouter(deps: Dependencies = {}) {
     const router = Router(), rooms = deps.rooms || new AmanRooms()
-    const authenticateClient = deps.authenticate || authenticate
+    const trustedEnabled = deps.registeredCidEnabled || (() => process.env.AMAN_ALLOW_REGISTERED_CID === "1")
+    const accountExists = deps.knownUser || isKnownUser
+    const findController = deps.controllerCid || controllerCid
+    const authenticateClient = deps.authenticate || (async (req: Request, res: Response): Promise<Principal | undefined> => {
+        if (req.headers["x-aman-auth"] !== "registered-cid") return authenticate(req, res)
+        if (!trustedEnabled()) throw new RelayError(403, "Registered CID mode is not enabled on this vatIRIS backend")
+        // Explicit AMAN-only trust mode. A CID is an account identifier, not a login token.
+        const callsign = req.headers["x-aman-callsign"]
+        const supplied = req.headers["x-aman-cid"]
+        if (typeof callsign !== "string" || !/^[A-Z0-9_-]{1,20}$/.test(callsign)) throw new RelayError(400, "Invalid EuroScope callsign")
+        if (supplied !== undefined && (typeof supplied !== "string" || !/^[1-9][0-9]{3,9}$/.test(supplied))) throw new RelayError(400, "Invalid controller CID")
+        const cid = req.params.net === "live" ? await findController(callsign) : supplied === undefined ? undefined : Number(supplied)
+        if (!cid) throw new RelayError(403, req.params.net === "live" ? "EuroScope callsign is not in the live ATC feed yet" : "Enter your CID in MAESTRO > Operation mode for SweatBox")
+        if (supplied !== undefined && Number(supplied) !== cid) throw new RelayError(403, "CID does not match the live EuroScope callsign")
+        if (!await accountExists(cid)) throw new RelayError(403, "This CID has not previously logged into vatIRIS")
+        return { cid, callsign }
+    })
     const atcConnected = deps.connected || connected
     const permitted = deps.supervisors || supervisors
     const timer = setInterval(() => rooms.sweep(), 2000)
@@ -86,6 +113,7 @@ export function createAmanRoomsRouter(deps: Dependencies = {}) {
     }
     async function identity(req: Request, principal: Principal, writable: boolean) {
         const c = client(req, principal)
+        if (principal.callsign && c.callsign !== principal.callsign) throw new RelayError(403, "EuroScope callsign changed; refresh controller identity")
         if (writable && !c.canSequence) throw new RelayError(403, "Observer cannot edit")
         if (req.params.net === "live" && c.canSequence && process.env.AMAN_REQUIRE_ATC !== "0"
             && (!principal.cid || !await atcConnected(principal.cid, c.callsign))) throw new RelayError(403, "CID and callsign are not connected as ATC")
@@ -94,6 +122,10 @@ export function createAmanRoomsRouter(deps: Dependencies = {}) {
     function supervisor(p: Principal) {
         if (!p.cid || !permitted().has(p.cid)) throw new RelayError(403, "Supervisor access required")
     }
+    // Resolves live CID automatically. SweatBox uses a saved CID, without OAuth.
+    route("post", "/identity", (req, res, room, p) => {
+        res.json({ data: { cid: p.cid ?? null, callsign: p.callsign ?? req.body?.callsign, supervisor: !!p.cid && permitted().has(p.cid), mode: p.callsign ? "registered-cid" : "authenticated" } })
+    })
     route("post", "/poll", async (req, res, room, p) => {
         const c = await identity(req, p, false)
         const input = req.body

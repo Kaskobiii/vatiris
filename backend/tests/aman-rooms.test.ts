@@ -181,6 +181,54 @@ test("actual HTTP routes authenticate writers and separate supervisor settings",
     } finally { relay.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())) }
 })
 
+test("registered CID mode resolves live callsigns and reuses existing vatIRIS accounts only", async () => {
+    let enabled = true, feedAvailable = true, known = new Set([1396125, 1234567])
+    const relay = createAmanRoomsRouter({ registeredCidEnabled: () => enabled, knownUser: async cid => known.has(cid),
+        controllerCid: async callsign => { if (!feedAvailable) throw new RelayError(503, "VATSIM controller feed unavailable"); return callsign === "ESSA_APP" ? 1396125 : callsign === "ESOS_1_CTR" ? 1234567 : undefined },
+        connected: async (cid, callsign) => cid === 1396125 && callsign === "ESSA_APP" || cid === 1234567 && callsign === "ESOS_1_CTR", supervisors: () => new Set([1396125]) })
+    const app = express(); app.use(express.json()); app.use("/aman/rooms", relay.router)
+    const server = app.listen(0, "127.0.0.1")
+    await new Promise<void>(resolve => server.once("listening", resolve))
+    const root = `http://127.0.0.1:${(server.address() as any).port}/aman/rooms/`
+    const send = async (room: string, suffix: string, headers: Record<string, string> = {}, body: any = {}, method = "POST") => {
+        const response = await fetch(root + room + suffix, { method, headers: { "content-type": "application/json", "x-aman-auth": "registered-cid", "x-aman-callsign": "ESSA_APP", ...headers }, body: method === "GET" ? undefined : JSON.stringify(body) })
+        return { status: response.status, body: await response.json() as any }
+    }
+    const live = "live/ESSA/live/saaman", metadata = { instanceId: "instance-a", callsign: "ESSA_APP", engine: a.engine, wait: false }
+    try {
+        const resolved = await send(live, "/identity")
+        assert.equal(resolved.status, 200); assert.equal(resolved.body.data.cid, 1396125); assert.equal(resolved.body.data.mode, "registered-cid")
+        const s = (await send(live, "/poll", {}, metadata)).body
+        assert.equal(s.role, "sequencer")
+        assert.equal((await send(live, "", {}, { ...metadata, ...s, requestId: "registered-publish", sequence: sequence(), checkpoint: { retained: true } }, "PUT")).status, 200)
+        const editor = { ...metadata, instanceId: "instance-b", callsign: "ESOS_1_CTR" }, editorHeaders = { "x-aman-callsign": "ESOS_1_CTR", "x-aman-cid": "1234567" }
+        const e = (await send(live, "/poll", editorHeaders, editor)).body
+        assert.equal(e.role, "editor"); assert.equal(e.checkpoint.retained, true)
+        assert.equal((await send(live, "/command", editorHeaders, { ...editor, requestId: "registered-edit", epoch: e.epoch, revision: e.revision, cmd: { op: "reorder", callsign: "SAS123" } })).status, 200)
+        assert.equal((await send(live, "/poll", { "x-aman-cid": "1234567" }, metadata)).status, 403)
+        assert.equal((await send(live, "/poll", {}, { ...metadata, callsign: "OTHER_APP" })).status, 403)
+        assert.equal((await send(live, "/identity", { "x-aman-callsign": "MISSING_APP" })).status, 403)
+        assert.equal((await send(live, "/identity", { "x-aman-cid": "1e6" })).status, 400)
+        assert.equal((await send(live, "/identity", { "x-aman-callsign": "invalid call" })).status, 400)
+        assert.equal((await send(key, "/identity")).status, 403)
+        assert.equal((await send(key, "/identity", { "x-aman-cid": "1396125" })).body.data.cid, 1396125)
+        assert.equal((await send(key, "/poll", { "x-aman-cid": "1234567" }, metadata)).status, 200)
+        assert.equal((await send(key, "/supervision", { "x-aman-cid": "1234567" }, {}, "GET")).status, 403)
+        assert.equal((await send(key, "/supervision", { "x-aman-cid": "1396125" }, {}, "GET")).status, 200)
+        assert.equal((await send(live, "/supervision", { "x-aman-callsign": "ESOS_1_CTR" }, {}, "GET")).status, 403)
+        known.delete(1396125)
+        assert.equal((await send(live, "/identity")).status, 403)
+        assert.equal((await send(key, "/leave", { "x-aman-cid": "1396125" }, metadata)).status, 403)
+        known.add(1396125); feedAvailable = false
+        assert.equal((await send(live, "/identity")).status, 503)
+        assert.equal((await send(key, "/identity", { "x-aman-cid": "1396125" })).status, 200)
+        feedAvailable = true; enabled = false
+        assert.equal((await send(live, "/identity")).status, 403)
+        assert.equal((await send(key, "/poll", { "x-aman-cid": "1396125" }, metadata)).status, 403)
+        assert.equal((await send(live, "/identity", { "x-aman-auth": "" })).status, 401)
+    } finally { relay.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())) }
+})
+
 test("production SweatBox key auth protects even leave; training key cannot grant supervision", async () => {
     const before = process.env.AMAN_SWEATBOX_KEY
     process.env.AMAN_SWEATBOX_KEY = "test-only-key"

@@ -89,3 +89,55 @@ npm run build
 Automated tests cover room isolation, compatible-engine election, lease fencing, recovery handover, retry/result delivery, stale output, resets, permissions, queue limits and actual Express HTTP requests. The focused type check avoids an existing unrelated AUP type mismatch in the current base branch.
 
 Before rollout, run two compatible clients in each of the two rooms against one SweatBox exercise. Verify within-room edits propagate, cross-room edits do not, supervisor settings propagate only within their room, disconnecting each sequencer preserves accepted slots, simulator reset clears old traffic, and each EuroScope instance displays only its selected room's guidance. Backend deployment and those real plugin acceptance tests remain separate from the local automated tests.
+
+
+## Registered CID mode for distributed AMAN plugins
+
+Deploy this update and set `AMAN_ALLOW_REGISTERED_CID=1` to enable the AMAN-only
+registered-CID trust mode. The default remains the existing VATSIM bearer or
+SweatBox key authentication. Existing vatIRIS web, account, data and legacy AMAN
+routes retain their authentication. No account migration or OAuth registration
+is needed. AMAN only reads existing `useraccount.cid` entries, which vatIRIS creates
+at login. It does not create accounts or update last-login timestamps.
+
+The DLL sends `X-AMAN-Auth: registered-cid` and `X-AMAN-Callsign`. In live rooms,
+the backend resolves that callsign against the current VATSIM ATC feed, obtains
+its CID, and checks the existing account. It refreshes the feed every 15 seconds
+and returns 503 when a required refresh fails. If `X-AMAN-CID` is also supplied it
+must match the live controller. In SweatBox rooms the DLL sends its saved CID as
+`X-AMAN-CID`; the feed is not used. A supplied CID must be 4–10 decimal digits.
+
+POST the scoped room's `/identity` endpoint with these headers and an empty JSON
+body to resolve identity before joining. The response is
+`{data:{cid,callsign,supervisor,mode:"registered-cid"}}`. Each subsequent scoped
+request sends the same headers and repeats the account/feed checks. Body callsign
+must match the header. Supervisory access still uses `AMAN_SUPERVISOR_CIDS`; being
+present in the account table does not grant it. Unknown CIDs, disconnected live
+callsigns and disabled trust mode return 403. Account/feed failures return 503.
+No VATSIM password, OAuth token, controller key or AMAN login popup is involved.
+
+This is explicitly a CID trust policy for a privately distributed simulator
+plugin: it verifies that an account exists and that a live callsign/CID is online,
+but does not authenticate possession of that account or of a particular DLL.
+The backend cannot identify whether a caller is the distributed DLL. Only AMAN
+room operations use this mode; it is not a substitute login for the vatIRIS site.
+
+### Deployment and test
+
+1. Build and deploy the backend normally, with access to the existing vatIRIS
+   PostgreSQL database, and set `AMAN_ALLOW_REGISTERED_CID=1` in its service environment.
+2. Retain the intended supervisor CID list and restart the service.
+3. Load SAAMAN 1.3.0. In Operation mode choose Shared backend / vatIRIS registered
+   CID and the deployed HTTPS origin. For live, CID is automatic; for SweatBox,
+   save the controller's own CID once. Use the same network, exercise and channel
+   on the two testing machines. Each controller must already exist in vatIRIS.
+4. Confirm one sequencer and one editor, then drag an arrival on either client,
+   check both clients agree, close the sequencer, and confirm owner handover.
+5. Confirm an unknown CID and a mismatched live callsign/CID are rejected; confirm
+   an ordinary registered controller cannot open supervision or change settings.
+6. With trust mode disabled, confirm the old bearer/SweatBox key route tests still
+   pass. No AMAN frontend or aircraft calculation engine is added to the server.
+
+Automated validation: 14 relay/HTTP tests, strict scoped TypeScript check and
+production backend bundle. The DLL separately tests automatic identity lookup,
+SweatBox CID selection, callsign changes, disconnection and malformed responses.

@@ -2,6 +2,16 @@ import { Pool } from "pg"
 
 const pool = new Pool()
 
+// Reuse the accounts created by vatIRIS login; AMAN does not create accounts.
+export async function isKnownUser(cid: number): Promise<boolean> {
+    const query = {
+        text: "SELECT 1 FROM useraccount WHERE cid = $1 LIMIT 1",
+        values: [cid], query_timeout: 5000,
+    }
+    const result = await pool.query(query)
+    return result.rowCount === 1
+}
+
 export async function testQuery() {
     const client = await pool.connect()
     try {
